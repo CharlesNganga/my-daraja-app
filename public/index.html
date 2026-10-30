@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>M-Pesa STK Push Test</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #f0f4f1;
+      color: #1f2937;
+    }
+
+    .card {
+      width: 100%;
+      max-width: 400px;
+      background: #ffffff;
+      padding: 32px 28px;
+      border-radius: 16px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+    }
+
+    h1 {
+      margin: 0 0 4px;
+      font-size: 1.5rem;
+      color: #15803d;
+    }
+
+    .subtitle {
+      margin: 0 0 24px;
+      font-size: 0.9rem;
+      color: #6b7280;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 0.85rem;
+      font-weight: 600;
+    }
+
+    input {
+      width: 100%;
+      padding: 12px 14px;
+      margin-bottom: 18px;
+      font-size: 1rem;
+      border: 1px solid #d1d5db;
+      border-radius: 10px;
+      outline: none;
+      transition: border-color 0.15s, box-shadow 0.15s;
+    }
+
+    input:focus {
+      border-color: #16a34a;
+      box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.2);
+    }
+
+    button {
+      width: 100%;
+      padding: 14px;
+      font-size: 1rem;
+      font-weight: 600;
+      color: #ffffff;
+      background: #16a34a;
+      border: none;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+
+    button:hover:not(:disabled) { background: #15803d; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    #status {
+      min-height: 1.4em;
+      margin: 18px 0 0;
+      font-size: 0.9rem;
+      text-align: center;
+      color: #6b7280;
+    }
+
+    #status.success { color: #15803d; }
+    #status.error   { color: #dc2626; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>M-Pesa STK Push</h1>
+    <p class="subtitle">Daraja sandbox test</p>
+
+    <label for="phone">Phone Number</label>
+    <input
+      type="tel"
+      id="phone"
+      value="254700000000"
+      placeholder="2547XXXXXXXX"
+      autocomplete="tel"
+    />
+
+    <label for="amount">Amount (KES)</label>
+    <input type="number" id="amount" value="1" min="1" step="1" />
+
+    <button id="payBtn" onclick="pay()">Pay Now</button>
+
+    <p id="status"></p>
+  </div>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const payBtn = document.getElementById('payBtn');
+
+    // Show a message and colour it: type is "success", "error", or "" (neutral)
+    function setStatus(message, type = '') {
+      statusEl.textContent = message; // textContent avoids injecting HTML from server messages
+      statusEl.className = type;
+    }
+
+    async function pay() {
+      const phone = document.getElementById('phone').value.trim();
+      const amount = document.getElementById('amount').value;
+
+      setStatus('Initiating payment prompt...');
+      payBtn.disabled = true; // prevent double-clicks sending two prompts
+
+      try {
+        const response = await fetch('/api/stkpush', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ phone, amount }),
+        });
+
+        const result = await response.json();
+
+        if (response.ok && result.success) {
+          setStatus('STK Push sent! Check your phone to enter PIN.', 'success');
+        } else {
+          setStatus(result.error || 'Payment request failed.', 'error');
+        }
+      } catch (err) {
+        // Network problem or server not running
+        setStatus('Could not reach the server. Is it running?', 'error');
+      } finally {
+        payBtn.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
