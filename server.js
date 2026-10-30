@@ -1,17 +1,22 @@
 /**
- * Minimal Daraja (M-Pesa) STK Push demo server
- * -------------------------------------------
- * Flow:
+ * Daraja (M-Pesa) STK Push + Transaction Status demo server
+ * ---------------------------------------------------------
+ * STK Push flow:
  *   Browser -> POST /api/stkpush -> Safaricom (prompt appears on phone)
  *   Customer enters PIN on phone
  *   Safaricom -> POST /api/callback (your server) with the result
+ *
+ * Transaction Status flow (asynchronous):
+ *   Browser -> POST /api/transaction-status -> Safaricom ("accepted")
+ *   Safaricom -> POST /api/transaction-status/result (the real answer)
+ *   Browser polls GET /api/transaction-status/result/:id until it arrives
  *
  * Requires Node 18+ (uses the built-in global fetch).
  * Install:  npm install express dotenv
  * Run:      node server.js
  */
 
-require('dotenv').config(); // 1. Load variables from .env into process.env
+require('dotenv').config(); // Load variables from .env into process.env
 const express = require('express');
 const path = require('path');
 
@@ -20,11 +25,13 @@ const {
   CONSUMER_SECRET,
   BUSINESS_SHORTCODE,
   PASSKEY,
-  CALLBACK_URL, // Must be a PUBLIC https URL, e.g. https://abc123.ngrok-free.app/api/callback
+  CALLBACK_URL, // PUBLIC https URL, e.g. https://abc123.ngrok-free.app/api/callback
+  INITIATOR_NAME,      // Only needed for Transaction Status (sandbox: testapi)
+  SECURITY_CREDENTIAL, // Only needed for Transaction Status (encrypted initiator password)
   PORT = 3000,
 } = process.env;
 
-// Fail fast if something is missing, so you get a clear message instead of a confusing API error
+// Fail fast if a core value is missing, so you get a clear message
 const required = { CONSUMER_KEY, CONSUMER_SECRET, BUSINESS_SHORTCODE, PASSKEY, CALLBACK_URL };
 for (const [name, value] of Object.entries(required)) {
   if (!value) {
@@ -35,14 +42,22 @@ for (const [name, value] of Object.entries(required)) {
 
 const SANDBOX_URL = 'https://sandbox.safaricom.co.ke';
 
+// Your public base URL, derived from CALLBACK_URL
+// (https://abc.ngrok-free.app/api/callback -> https://abc.ngrok-free.app)
+const PUBLIC_BASE_URL = CALLBACK_URL.replace(/\/api\/callback\/?$/, '');
+
+// In-memory store of Transaction Status results, keyed by OriginatorConversationID.
+// Fine for learning; a real app would use a database.
+const statusResults = new Map();
+
 const app = express();
 
-// 2. Middleware: parse JSON bodies and serve the frontend from /public
+// Middleware: parse JSON bodies and serve the frontend from /public
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 /**
- * 3. Get an OAuth access token from Safaricom.
+ * Get an OAuth access token from Safaricom.
  * Basic Auth = base64("consumerKey:consumerSecret").
  * Tokens last about 1 hour. For simplicity we request a fresh one each time;
  * a real app would cache it until shortly before it expires.
@@ -84,7 +99,11 @@ function normalizePhone(input) {
   return /^254[71]\d{8}$/.test(phone) ? phone : null;
 }
 
-// 4. Trigger an STK Push (the PIN prompt on the customer's phone)
+// ===========================================================================
+// STK PUSH
+// ===========================================================================
+
+// Trigger an STK Push (the PIN prompt on the customer's phone)
 app.post('/api/stkpush', async (req, res) => {
   try {
     const { phone, amount } = req.body;
@@ -148,7 +167,7 @@ app.post('/api/stkpush', async (req, res) => {
   }
 });
 
-// 5. Safaricom calls this URL with the final result of the payment
+// Safaricom calls this URL with the final result of the payment
 app.post('/api/callback', (req, res) => {
   console.log('--- M-Pesa callback received ---');
   console.log(JSON.stringify(req.body, null, 2));
@@ -166,7 +185,7 @@ app.post('/api/callback', (req, res) => {
         phone: get('PhoneNumber'),
       });
     } else {
-      // e.g. 1032 = cancelled by user, 1 = insufficient funds
+      // e.g. 1032 = cancelled by user, 1 = insufficient funds, 1037 = timed out
       console.log(`NOT PAID (code ${cb.ResultCode}): ${cb.ResultDesc}`);
     }
   }
@@ -175,7 +194,115 @@ app.post('/api/callback', (req, res) => {
   res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 });
 
-// 6. Start the server
+// ===========================================================================
+// TRANSACTION STATUS QUERY (reconciliation)
+// ===========================================================================
+
+// 1. Ask Safaricom about a transaction by its M-Pesa receipt number
+app.post('/api/transaction-status', async (req, res) => {
+  try {
+    const transactionId = String(req.body.transactionId || '').trim().toUpperCase();
+
+    // M-Pesa receipt numbers are 10 uppercase letters/digits, e.g. LHD1234567
+    if (!/^[A-Z0-9]{10}$/.test(transactionId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid receipt number. Expected 10 letters/digits, e.g. LHD1234567.',
+      });
+    }
+
+    if (!INITIATOR_NAME || !SECURITY_CREDENTIAL) {
+      return res.status(500).json({
+        success: false,
+        error: 'INITIATOR_NAME and SECURITY_CREDENTIAL are missing in .env.',
+      });
+    }
+
+    const token = await getAccessToken();
+
+    const payload = {
+      Initiator: INITIATOR_NAME,
+      SecurityCredential: SECURITY_CREDENTIAL, // initiator password, RSA-encrypted
+      CommandID: 'TransactionStatusQuery',
+      TransactionID: transactionId,
+      PartyA: BUSINESS_SHORTCODE,
+      IdentifierType: '4',                      // 4 = organization shortcode
+      ResultURL: `${PUBLIC_BASE_URL}/api/transaction-status/result`,
+      QueueTimeOutURL: `${PUBLIC_BASE_URL}/api/transaction-status/timeout`,
+      Remarks: 'Status check',
+      Occasion: 'Reconciliation',
+    };
+
+    const response = await fetch(`${SANDBOX_URL}/mpesa/transactionstatus/v1/query`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+
+    // ResponseCode "0" = query accepted. The result itself arrives at ResultURL.
+    if (response.ok && data.ResponseCode === '0') {
+      return res.json({
+        success: true,
+        message: 'Query accepted. Waiting for Safaricom to send the result.',
+        originatorConversationID: data.OriginatorConversationID,
+      });
+    }
+
+    console.error('Transaction status rejected:', data);
+    return res.status(400).json({
+      success: false,
+      error: data.errorMessage || data.ResponseDescription || 'Transaction status query failed',
+    });
+  } catch (err) {
+    console.error('Transaction status error:', err.message);
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// 2. Safaricom posts the actual query result here
+app.post('/api/transaction-status/result', (req, res) => {
+  console.log('--- Transaction status result ---');
+  console.log(JSON.stringify(req.body, null, 2));
+
+  const result = req.body?.Result;
+  if (result) {
+    // ResultParameter is an array of { Key, Value }; turn it into a plain object
+    const params = result.ResultParameters?.ResultParameter || [];
+    const details = Object.fromEntries(params.map((p) => [p.Key, p.Value]));
+
+    statusResults.set(result.OriginatorConversationID, {
+      success: result.ResultCode === 0,
+      resultCode: result.ResultCode,
+      resultDesc: result.ResultDesc,
+      details,
+    });
+  }
+
+  res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+});
+
+// 3. Safaricom calls this if the query timed out in their queue
+app.post('/api/transaction-status/timeout', (req, res) => {
+  console.log('--- Transaction status TIMEOUT ---');
+  console.log(JSON.stringify(req.body, null, 2));
+  res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+});
+
+// 4. The browser polls this until the result has arrived
+app.get('/api/transaction-status/result/:id', (req, res) => {
+  const result = statusResults.get(req.params.id);
+  if (!result) return res.json({ pending: true });
+  res.json({ pending: false, ...result });
+});
+
+// ===========================================================================
+// START SERVER
+// ===========================================================================
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
 });

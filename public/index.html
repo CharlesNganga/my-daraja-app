@@ -11,8 +11,10 @@
       margin: 0;
       min-height: 100vh;
       display: flex;
+      flex-direction: column; /* stack the two cards */
       align-items: center;
       justify-content: center;
+      gap: 24px;
       padding: 16px;
       font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       background: #f0f4f1;
@@ -79,7 +81,8 @@
     button:hover:not(:disabled) { background: #15803d; }
     button:disabled { opacity: 0.6; cursor: not-allowed; }
 
-    #status {
+    #status,
+    #queryStatus {
       min-height: 1.4em;
       margin: 18px 0 0;
       font-size: 0.9rem;
@@ -87,11 +90,16 @@
       color: #6b7280;
     }
 
-    #status.success { color: #15803d; }
-    #status.error   { color: #dc2626; }
+    #status.success,
+    #queryStatus.success { color: #15803d; }
+
+    #status.error,
+    #queryStatus.error { color: #dc2626; }
   </style>
 </head>
 <body>
+
+  <!-- ===================== Card 1: STK Push ===================== -->
   <div class="card">
     <h1>M-Pesa STK Push</h1>
     <p class="subtitle">Daraja sandbox test</p>
@@ -113,7 +121,28 @@
     <p id="status"></p>
   </div>
 
+  <!-- ================ Card 2: Check Transaction Status ================ -->
+  <div class="card">
+    <h1>Check Transaction Status</h1>
+    <p class="subtitle">Look up a payment by its M-Pesa receipt number</p>
+
+    <label for="receipt">M-Pesa Receipt Number</label>
+    <input
+      type="text"
+      id="receipt"
+      placeholder="e.g. LHD1234567"
+      maxlength="10"
+      autocomplete="off"
+      style="text-transform: uppercase;"
+    />
+
+    <button id="checkBtn" onclick="checkStatus()">Check Status</button>
+
+    <p id="queryStatus"></p>
+  </div>
+
   <script>
+    // ======================= STK Push =======================
     const statusEl = document.getElementById('status');
     const payBtn = document.getElementById('payBtn');
 
@@ -149,6 +178,77 @@
         setStatus('Could not reach the server. Is it running?', 'error');
       } finally {
         payBtn.disabled = false;
+      }
+    }
+
+    // ================= Check Transaction Status =================
+    const queryStatusEl = document.getElementById('queryStatus');
+    const checkBtn = document.getElementById('checkBtn');
+
+    function setQueryStatus(message, type = '') {
+      queryStatusEl.textContent = message;
+      queryStatusEl.className = type;
+    }
+
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // The query result is delivered to the server asynchronously by Safaricom,
+    // so we poll the server until it has arrived (up to about 30 seconds).
+    async function pollForResult(originatorConversationID) {
+      for (let attempt = 0; attempt < 15; attempt++) {
+        await sleep(2000);
+        const res = await fetch(
+          `/api/transaction-status/result/${encodeURIComponent(originatorConversationID)}`
+        );
+        const data = await res.json();
+        if (!data.pending) return data;
+      }
+      return null; // gave up waiting
+    }
+
+    async function checkStatus() {
+      const transactionId = document.getElementById('receipt').value.trim().toUpperCase();
+
+      if (!transactionId) {
+        setQueryStatus('Enter a receipt number first.', 'error');
+        return;
+      }
+
+      setQueryStatus('Sending status query...');
+      checkBtn.disabled = true; // prevent double clicks
+
+      try {
+        const response = await fetch('/api/transaction-status', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ transactionId }),
+        });
+        const result = await response.json();
+
+        if (!(response.ok && result.success)) {
+          setQueryStatus(result.error || 'Status query failed.', 'error');
+          return;
+        }
+
+        setQueryStatus('Query accepted. Waiting for Safaricom to respond...');
+        const outcome = await pollForResult(result.originatorConversationID);
+
+        if (!outcome) {
+          setQueryStatus('No result yet. Check the server terminal and try again shortly.', 'error');
+        } else if (outcome.success) {
+          const d = outcome.details || {};
+          const parts = [d.TransactionStatus, d.Amount && `KES ${d.Amount}`].filter(Boolean);
+          setQueryStatus(
+            `${transactionId}: ${parts.length ? parts.join(' · ') : outcome.resultDesc}`,
+            'success'
+          );
+        } else {
+          setQueryStatus(`${outcome.resultDesc} (code ${outcome.resultCode})`, 'error');
+        }
+      } catch (err) {
+        setQueryStatus('Could not reach the server. Is it running?', 'error');
+      } finally {
+        checkBtn.disabled = false;
       }
     }
   </script>
